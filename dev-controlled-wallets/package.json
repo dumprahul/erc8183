@@ -6,7 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "register": "tsx --env-file=.env register-entity-secret.ts",
-    "create-wallet": "tsx --env-file=.env create-wallet.ts"
+    "create-wallet": "tsx --env-file=.env create-wallet.ts",
+    "sign": "tsx --env-file=.env sign-transaction.ts"
   },
   "keywords": [],
   "author": "",
