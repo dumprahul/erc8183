@@ -2,3 +2,5 @@
 
 /dev-controlled-wallets/recovery
 /dev-controlled-wallets/node_modules
+dev-controlled-wallets/.env
+.env
