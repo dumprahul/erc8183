@@ -1,13 +1,7 @@
 import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
-import {
-  createPublicClient,
-  encodeFunctionData,
-  http,
-  parseGwei,
-  parseUnits,
-  toHex,
-} from "viem";
+import { createPublicClient, http } from "viem";
 import { arcTestnet } from "viem/chains";
+import { setTimeout as delay } from "node:timers/promises";
 
 const client = initiateDeveloperControlledWalletsClient({
   apiKey: process.env.CIRCLE_API_KEY!,
@@ -19,22 +13,11 @@ const publicClient = createPublicClient({
   transport: http(),
 });
 
-const WALLET_ID   = process.env.WALLET_ID ?? "";
-const USDC        = "0x3600000000000000000000000000000000000000" as const;
-const RECIPIENT   = "0x0612D26676869aFcF8BCfdcC55Bd62a307fBF4b5" as const;
-const AMOUNT      = parseUnits("1", 6); // 1 USDC — 6 decimals
+const WALLET_ID = process.env.WALLET_ID ?? "";
+const USDC      = "0x3600000000000000000000000000000000000000" as const;
+const RECIPIENT = "0x0612D26676869aFcF8BCfdcC55Bd62a307fBF4b5" as const;
 
 const erc20Abi = [
-  {
-    name: "transfer",
-    type: "function",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "to",     type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-  },
   {
     name: "balanceOf",
     type: "function",
@@ -44,10 +27,24 @@ const erc20Abi = [
   },
 ] as const;
 
-async function main() {
-  if (!WALLET_ID) {
-    throw new Error("Set WALLET_ID in your .env (must be an EOA wallet)");
+async function waitForTx(txId: string, label: string): Promise<string> {
+  process.stdout.write(`  Waiting for ${label}`);
+  for (let i = 0; i < 60; i++) {
+    await delay(2000);
+    const res = await client.getTransaction({ id: txId });
+    const tx = res.data?.transaction;
+    if (tx?.state === "COMPLETE" && tx.txHash) {
+      console.log(" ✓");
+      return tx.txHash;
+    }
+    if (tx?.state === "FAILED") throw new Error(`${label} failed on-chain`);
+    process.stdout.write(".");
   }
+  throw new Error(`${label} timed out`);
+}
+
+async function main() {
+  if (!WALLET_ID) throw new Error("Set WALLET_ID in your .env");
 
   // Fetch sender wallet
   console.log("── Fetching wallet ──");
@@ -57,99 +54,64 @@ async function main() {
   const sender = wallet.address as `0x${string}`;
   console.log("  Sender:     ", sender);
   console.log("  Recipient:  ", RECIPIENT);
-  console.log("  Amount:     1 USDC");
+  console.log("  Amount:      1 USDC");
 
-  // Check sender USDC balance before
-  const balanceBefore = await publicClient.readContract({
-    address: USDC,
-    abi: erc20Abi,
-    functionName: "balanceOf",
-    args: [sender],
-  });
-  console.log("\n── Balances Before ──");
-  console.log("  Sender USDC:    ", Number(balanceBefore) / 1e6, "USDC");
-
-  // Fetch nonce + fee data
-  console.log("\n── Fetching on-chain data ──");
-  const [nonce, feeData] = await Promise.all([
-    publicClient.getTransactionCount({ address: sender }),
-    publicClient.estimateFeesPerGas(),
+  // Balances before
+  const [balBefore, recipBalBefore] = await Promise.all([
+    publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [sender] }),
+    publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [RECIPIENT] }),
   ]);
-  console.log("  Nonce:              ", nonce);
-  console.log("  MaxFeePerGas:       ", feeData.maxFeePerGas?.toString(), "wei");
-  console.log("  MaxPriorityFeeGas:  ", feeData.maxPriorityFeePerGas?.toString(), "wei");
+  console.log("\n── Balances Before ──");
+  console.log("  Sender USDC:    ", Number(balBefore) / 1e6, "USDC");
+  console.log("  Recipient USDC: ", Number(recipBalBefore) / 1e6, "USDC");
 
-  // Encode ERC-20 transfer(to, amount) calldata
-  const data = encodeFunctionData({
-    abi: erc20Abi,
-    functionName: "transfer",
-    args: [RECIPIENT, AMOUNT],
-  });
-
-  // Estimate gas for the token transfer
-  const gasEstimate = await publicClient.estimateGas({
-    account: sender,
-    to: USDC,
-    data,
-  });
-  console.log("  Gas Estimate:       ", gasEstimate.toString());
-
-  // Build EIP-1559 transaction targeting the USDC contract
-  const transaction = {
-    chainId: toHex(arcTestnet.id),
-    nonce: toHex(nonce),
-    to: USDC,
-    value: toHex(0),
-    gas: toHex((gasEstimate * 120n) / 100n), // +20% buffer
-    maxFeePerGas: toHex(feeData.maxFeePerGas ?? parseGwei("1")),
-    maxPriorityFeePerGas: toHex(feeData.maxPriorityFeePerGas ?? parseGwei("1")),
-    data,
-  };
-
-  console.log("\n── Transaction to sign ──");
-  console.log(JSON.stringify(transaction, null, 2));
-
-  // Sign via Circle HSM — private key never leaves Circle
-  console.log("\n── Signing transaction ──");
-  const signRes = await client.signTransaction({
+  // Use createTransaction — Circle signs + broadcasts on Arc Testnet natively
+  console.log("\n── Submitting 1 USDC transfer via Circle ──");
+  const txRes = await client.createTransaction({
     walletId: WALLET_ID,
-    transaction: JSON.stringify(transaction),
+    blockchain: "ARC-TESTNET",
+    tokenAddress: USDC,
+    destinationAddress: RECIPIENT,
+    amounts: ["1"],
+    fee: { type: "level", config: { feeLevel: "MEDIUM" } },
   });
 
-  const result = signRes.data;
+  const txId = txRes.data?.id;
+  if (!txId) throw new Error("No transaction ID returned");
+  console.log("  Transaction ID: ", txId);
 
-  console.log("\n── Signature Results ──");
-  console.log("  Signature:          ", result?.signature);
-  console.log("  Signed Transaction: ", result?.signedTransaction);
-  console.log("  Tx Hash:            ", result?.txHash ?? "(broadcast manually to get hash)");
+  console.log("\n── Polling for confirmation ──");
+  const txHash = await waitForTx(txId, "USDC transfer");
+  console.log("  Tx Hash:  ", txHash);
+  console.log("  Explorer: ", `${arcTestnet.blockExplorers.default.url}/tx/${txHash}`);
 
-  console.log("\n── Raw Result Object ──");
-  console.log(JSON.stringify(result, null, 2));
+  // Fetch full tx details for signature + raw data
+  const txDetail = await client.getTransaction({ id: txId });
+  const txData = txDetail.data?.transaction;
+  console.log("\n── Transaction Details ──");
+  console.log("  State:      ", txData?.state);
+  console.log("  Tx Hash:    ", txData?.txHash);
+  console.log("  Network Fee:", txData?.networkFee ?? "N/A");
+  console.log("\n── Raw Transaction Object ──");
+  console.log(JSON.stringify(txData, null, 2));
 
-  // Broadcast if we have the signed tx
-  if (result?.signedTransaction) {
-    console.log("\n── Broadcasting transaction ──");
-    const txHash = await publicClient.sendRawTransaction({
-      serializedTransaction: result.signedTransaction as `0x${string}`,
-    });
-    console.log("  Tx Hash:  ", txHash);
-    console.log("  Explorer: ", `${arcTestnet.blockExplorers.default.url}/tx/${txHash}`);
+  // Receipt from chain
+  const receipt = await publicClient.getTransactionReceipt({ hash: txHash as `0x${string}` });
+  console.log("\n── On-chain Receipt ──");
+  console.log("  Status:   ", receipt.status === "success" ? "✓ success" : "✗ reverted");
+  console.log("  Block:    ", receipt.blockNumber.toString());
+  console.log("  Gas Used: ", receipt.gasUsed.toString());
 
-    console.log("\n  Waiting for confirmation...");
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
-    console.log("  Status:   ", receipt.status === "success" ? "✓ success" : "✗ reverted");
-    console.log("  Block:    ", receipt.blockNumber.toString());
-    console.log("  Gas Used: ", receipt.gasUsed.toString());
-
-    // Check balances after
-    const [balAfterSender, balAfterRecipient] = await Promise.all([
-      publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [sender] }),
-      publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [RECIPIENT] }),
-    ]);
-    console.log("\n── Balances After ──");
-    console.log("  Sender USDC:    ", Number(balAfterSender) / 1e6, "USDC");
-    console.log("  Recipient USDC: ", Number(balAfterRecipient) / 1e6, "USDC");
-  }
+  // Balances after
+  const [balAfter, recipBalAfter] = await Promise.all([
+    publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [sender] }),
+    publicClient.readContract({ address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [RECIPIENT] }),
+  ]);
+  console.log("\n── Balances After ──");
+  console.log("  Sender USDC:    ", Number(balAfter) / 1e6, "USDC");
+  console.log("  Recipient USDC: ", Number(recipBalAfter) / 1e6, "USDC");
+  console.log("\n  Δ Sender:    -", (Number(balBefore) - Number(balAfter)) / 1e6, "USDC");
+  console.log("  Δ Recipient: +", (Number(recipBalAfter) - Number(recipBalBefore)) / 1e6, "USDC");
 }
 
 main().catch((err) => {
